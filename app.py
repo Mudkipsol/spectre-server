@@ -127,21 +127,22 @@ def verify_key():
             conn.close()
             return jsonify({'valid': False, 'reason': 'License expired'}), 403
     
-        # Step 1.1.5: Telegram binding (only for trial and fam)
-        if tier in ['trial', 'fam']:
-            if not issued_to:
-                cursor.execute('UPDATE licenses SET issued_to = ? WHERE key = ?', (telegram_id, user_key))
-                conn.commit()
-                issued_to = telegram_id
-        elif issued_to != telegram_id and not issued_to.endswith('@gmail.com'):
-                print("❌ Rejected: Telegram ID mismatch")
-                conn.close()
-                return jsonify({'valid': False, 'reason': 'Key bound to a different Telegram user'}), 403
-        elif issued_to.endswith('@gmail.com'):
-            # Convert from email to Telegram ID on first use
+    # Step 1.1.5: Telegram binding (only for trial and fam)
+    if tier in ['trial', 'fam']:
+        if not issued_to:
+            # First time use: assign Telegram ID
             cursor.execute('UPDATE licenses SET issued_to = ? WHERE key = ?', (telegram_id, user_key))
             conn.commit()
             issued_to = telegram_id
+        elif issued_to.endswith('@gmail.com'):
+            # Upgrade email to Telegram ID on first use
+            cursor.execute('UPDATE licenses SET issued_to = ? WHERE key = ?', (telegram_id, user_key))
+            conn.commit()
+            issued_to = telegram_id
+        elif issued_to != telegram_id:
+            print("❌ Rejected: Telegram ID mismatch (expected:", issued_to, ")")
+            conn.close()
+            return jsonify({'valid': False, 'reason': 'Key bound to a different Telegram user'}), 403
         
         # Step 1.2: HWID binding (allowed for all tiers except master if not yet set)
         if not stored_hwid and tier != 'master':
