@@ -945,6 +945,25 @@ def init_va_db():
     conn.commit()
     conn.close()
 
+@app.route('/admin_delete_key', methods=['POST'])
+def admin_delete_key():
+    auth = request.headers.get("Authorization")
+    if auth != "RichOffSoftware22!":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.get_json()
+    key_to_delete = data.get("key")
+    if not key_to_delete:
+        return jsonify({"error": "No key provided"}), 400
+
+    conn = sqlite3.connect("licenses.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM licenses WHERE key = ?", (key_to_delete,))
+    conn.commit()
+    conn.close()
+
+    return jsonify({"status": "deleted", "key": key_to_delete})
+
 if __name__ == '__main__':
     init_db()
     init_va_db()
