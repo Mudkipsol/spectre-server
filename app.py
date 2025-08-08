@@ -117,9 +117,13 @@ def verify_key():
     cursor.execute('SELECT tier, credits, expires_at, hwid, issued_to FROM licenses WHERE key = ?', (user_key,))
     result = cursor.fetchone()
 
-    if result:
-        tier, credits, expires_at, stored_hwid, issued_to = result
-        stored_hwid = stored_hwid or None
+    if not result:
+        print("❌ Rejected: Key not found")
+        conn.close()
+        return jsonify({'valid': False, 'reason': 'Key not found'}), 403
+    
+    tier, credits, expires_at, stored_hwid, issued_to = result
+    stored_hwid = stored_hwid or None
 
         # Step 1.1: Check expiration
         if expires_at and datetime.fromisoformat(expires_at) < datetime.utcnow():
