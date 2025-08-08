@@ -122,8 +122,8 @@ def verify_key():
         conn.close()
         return jsonify({'valid': False, 'reason': 'Key not found'}), 403
     
-    tier, credits, expires_at, stored_hwid, issued_to = result
-    stored_hwid = stored_hwid or None
+        tier, credits, expires_at, stored_hwid, issued_to = result
+        stored_hwid = stored_hwid or None
 
         # Step 1.1: Check expiration
         if expires_at and datetime.fromisoformat(expires_at) < datetime.utcnow():
