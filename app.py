@@ -117,11 +117,7 @@ def verify_key():
     cursor.execute('SELECT tier, credits, expires_at, hwid, issued_to FROM licenses WHERE key = ?', (user_key,))
     result = cursor.fetchone()
 
-    if not result:
-        print("❌ Rejected: Key not found")
-        conn.close()
-        return jsonify({'valid': False, 'reason': 'Key not found'}), 403
-    
+    if result:
         tier, credits, expires_at, stored_hwid, issued_to = result
         stored_hwid = stored_hwid or None
 
