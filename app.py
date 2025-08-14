@@ -7,22 +7,32 @@ import stripe
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from functools import wraps
-DB_PATH = 'licenses.db'  # Define this first
-print("📁 Using DB at:", os.path.abspath(DB_PATH))  # Now you can print it
-stripe.api_key = 'sk_test_51RUAN1L88MM2LpTSb6XS2g4JlYUAvjz50knRbDJMIlmPywpoXTAICnDBUyXRpaSv7GnSxfRnwSd8v91L1ShI8ZFo00KIVcoajr'
+
+# --- Paths / DB ---
+DB_PATH = 'licenses.db'
+print("📁 Using DB at:", os.path.abspath(DB_PATH))
+
+# --- Live secrets from environment ---
+STRIPE_SECRET_KEY     = os.environ.get('STRIPE_SECRET_KEY', '')
+STRIPE_PUBLISHABLE    = os.environ.get('STRIPE_PUBLISHABLE_KEY', '')
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
+SERVER_SECRET         = os.environ.get('SERVER_SECRET', '')
+MASTER_KEY            = os.environ.get('MASTER_KEY', 'spectre-master-7788')
+APP_BASE_URL          = os.environ.get('APP_BASE_URL', 'https://spectrespoofer.com')
+
+# Fail fast if not live key
+if not STRIPE_SECRET_KEY.startswith('sk_live_'):
+    print("❌ STRIPE_SECRET_KEY is missing or not a LIVE key.")
+stripe.api_key = STRIPE_SECRET_KEY
 
 app = Flask(__name__)
-
 limiter = Limiter(get_remote_address, app=app, default_limits=["10 per minute"])
-SERVER_SECRET = "RichOffSoftware22!"  # change this to your real server password
 
-DB_PATH = 'licenses.db'
-MASTER_KEY = 'spectre-master-7788'
 
+# ----------------- DB bootstrap -----------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS licenses (
             key TEXT PRIMARY KEY,
@@ -36,18 +46,19 @@ def init_db():
             last_reset TEXT
         )
     ''')
-
     conn.commit()
     conn.close()
+
 
 def require_server_auth(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
         auth = request.headers.get("Authorization")
-        if auth != SERVER_SECRET:
+        if not SERVER_SECRET or auth != SERVER_SECRET:
             return jsonify({"error": "Unauthorized"}), 401
         return f(*args, **kwargs)
     return wrapper
+
 
 def key_exists(key):
     conn = sqlite3.connect(DB_PATH)
@@ -56,6 +67,7 @@ def key_exists(key):
     exists = cursor.fetchone() is not None
     conn.close()
     return exists
+
 
 def reset_usage_if_needed(key, conn=None):
     own_conn = False
@@ -91,20 +103,25 @@ def reset_usage_if_needed(key, conn=None):
     if own_conn:
         conn.close()
 
+
+# ----------------- Routes -----------------
 @app.route('/')
 def index():
     return jsonify({"status": "Spectre License API running."})
 
+
 @app.route('/verify', methods=['POST'])
 def verify_key():
-    data = request.json
+    data = request.json or {}
     telegram_id = data.get('telegram_id', '').strip()
     user_key = data.get('key', '').strip()
     hwid = str(data.get('hwid')).strip() if data.get('hwid') else None
+
     print("🚨 /verify POST received")
     print("➡️ Key:", user_key)
     print("➡️ HWID:", hwid)
     print("➡️ Telegram ID:", telegram_id)
+
     ip = request.headers.get('X-Forwarded-For', request.remote_addr)
 
     if not hwid:
@@ -113,7 +130,7 @@ def verify_key():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # Step 1: Check if it’s a direct license key
+    # Step 1: Direct license key
     cursor.execute('SELECT tier, credits, expires_at, hwid, issued_to FROM licenses WHERE key = ?', (user_key,))
     result = cursor.fetchone()
 
@@ -121,54 +138,39 @@ def verify_key():
         tier, credits, expires_at, stored_hwid, issued_to = result
         stored_hwid = stored_hwid or None
 
-        # Step 1.1: Check expiration
         if expires_at and datetime.fromisoformat(expires_at) < datetime.utcnow():
             print("❌ Rejected: License expired")
             conn.close()
             return jsonify({'valid': False, 'reason': 'License expired'}), 403
-    
-    # Step 1.1.5: Telegram binding (only for trial and fam)
-    if tier in ['trial', 'fam']:
-        if not issued_to:
-            # First time use: assign Telegram ID
-            cursor.execute('UPDATE licenses SET issued_to = ? WHERE key = ?', (telegram_id, user_key))
-            conn.commit()
-            issued_to = telegram_id
-        elif issued_to.endswith('@gmail.com'):
-            # Upgrade email to Telegram ID on first use
-            cursor.execute('UPDATE licenses SET issued_to = ? WHERE key = ?', (telegram_id, user_key))
-            conn.commit()
-            issued_to = telegram_id
-        elif issued_to != telegram_id:
-            print("❌ Rejected: Telegram ID mismatch (expected:", issued_to, ")")
-            conn.close()
-            return jsonify({'valid': False, 'reason': 'Key bound to a different Telegram user'}), 403
-        
-        # Step 1.2: HWID binding (allowed for all tiers except master if not yet set)
+
+        # Telegram binding for trial/fam
+        if tier in ['trial', 'fam']:
+            if not issued_to or issued_to.endswith('@gmail.com'):
+                cursor.execute('UPDATE licenses SET issued_to = ? WHERE key = ?', (telegram_id, user_key))
+                conn.commit()
+                issued_to = telegram_id
+            elif issued_to != telegram_id:
+                print("❌ Rejected: Telegram ID mismatch (expected:", issued_to, ")")
+                conn.close()
+                return jsonify({'valid': False, 'reason': 'Key bound to a different Telegram user'}), 403
+
+        # HWID binding/mismatch checks (except master)
         if not stored_hwid and tier != 'master':
             cursor.execute('UPDATE licenses SET hwid = ? WHERE key = ?', (hwid, user_key))
             conn.commit()
-            stored_hwid = hwid  # Continue to next step with bound HWID
+            stored_hwid = hwid
 
-        # Step 1.3: HWID mismatch (skip if master)
         if stored_hwid and hwid != stored_hwid and tier != 'master':
             print(f"❌ Rejected: HWID mismatch (stored: {stored_hwid}, sent: {hwid})")
             conn.close()
             return jsonify({'valid': False, 'reason': 'HWID mismatch'}), 403
 
-        # Step 1.4: All good
         conn.close()
         return jsonify({'valid': True, 'tier': tier, 'credits': credits})
-    
-        # Final fallback — key not found or failed all conditions
-        print("❌ Rejected: Final fallback (key not accepted by any condition)")
-        conn.close()
-        return jsonify({'valid': False, 'reason': 'Key not found'}), 403
 
-    # Step 2: Check if it's a VA key
+    # Step 2: VA key path
     cursor.execute('SELECT parent_key FROM va_keys WHERE va_key = ?', (user_key,))
     va_row = cursor.fetchone()
-
     if va_row:
         parent_key = va_row[0]
         cursor.execute('SELECT tier, credits, expires_at FROM licenses WHERE key = ?', (parent_key,))
@@ -192,9 +194,9 @@ def verify_key():
         conn.close()
         return jsonify({'valid': False, 'reason': 'Trial already used on this machine or IP'}), 403
 
-    # Final fallback
     conn.close()
     return jsonify({'valid': False, 'reason': 'Key not found'}), 403
+
 
 @app.route('/generate_key', methods=['GET', 'POST'])
 @require_server_auth
@@ -205,7 +207,7 @@ def generate_key():
     credits = data.get('credits')
     issued_to = data.get('issued_to')
 
-    if not tier or not credits or not issued_to:
+    if not tier or credits is None or not issued_to:
         return jsonify({'error': 'Missing tier, credits, or issued_to'}), 400
 
     new_key = str(uuid.uuid4()).replace('-', '') + str(uuid.uuid4()).split('-')[0]
@@ -223,11 +225,12 @@ def generate_key():
 
     return jsonify({'generated_key': new_key})
 
+
 @app.route('/edit_key', methods=['POST'])
 @require_server_auth
 @limiter.limit("5 per minute")
 def edit_key():
-    data = request.get_json()
+    data = request.get_json() or {}
     key = data.get('key')
     new_tier = data.get('tier')
     new_credits = data.get('credits')
@@ -240,8 +243,7 @@ def edit_key():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    updates = []
-    params = []
+    updates, params = [], []
 
     if new_tier:
         updates.append("tier = ?")
@@ -257,6 +259,7 @@ def edit_key():
         params.append(new_expires_at)
 
     if not updates:
+        conn.close()
         return jsonify({"error": "No fields to update"}), 400
 
     params.append(key)
@@ -266,6 +269,7 @@ def edit_key():
     conn.close()
 
     return jsonify({"message": "Key updated successfully"})
+
 
 @app.route('/view_keys', methods=['GET'])
 @require_server_auth
@@ -277,31 +281,29 @@ def view_keys():
 
     if tier_filter:
         cursor.execute('SELECT key, tier, credits, issued_to, created_at, expires_at FROM licenses WHERE tier = ?', (tier_filter,))
+        rows = cursor.fetchall()
+        keys = [{
+            'key': row[0], 'tier': row[1], 'credits': row[2],
+            'issued_to': row[3], 'created_at': row[4], 'expires_at': row[5]
+        } for row in rows]
     else:
         cursor.execute('SELECT key, tier, credits, issued_to, created_at, expires_at, hwid FROM licenses')
+        rows = cursor.fetchall()
+        keys = [{
+            'key': row[0], 'tier': row[1], 'credits': row[2], 'issued_to': row[3],
+            'created_at': row[4], 'expires_at': row[5], 'hwid': row[6]
+        } for row in rows]
 
-    rows = cursor.fetchall()
     conn.close()
-
-    keys = [{
-        'key': row[0],
-        'tier': row[1],
-        'credits': row[2],
-        'issued_to': row[3],
-        'created_at': row[4],
-        'expires_at': row[5],
-        'hwid': row[6]
-    } for row in rows]
-
     return jsonify({'keys': keys})
+
 
 @app.route('/delete_key', methods=['POST'])
 @require_server_auth
 @limiter.limit("5 per minute")
 def delete_key():
-    data = request.get_json()
+    data = request.get_json() or {}
     license_key = data.get('key')
-
     if not license_key:
         return jsonify({'error': 'Missing license key'}), 400
 
@@ -313,11 +315,12 @@ def delete_key():
 
     return jsonify({'message': 'Key deleted successfully'})
 
+
 @app.route('/extend_key', methods=['POST'])
 @require_server_auth
 @limiter.limit("5 per minute")
 def extend_key():
-    data = request.get_json()
+    data = request.get_json() or {}
     key = data.get('key')
     new_tier = data.get('new_tier')
     additional_credits = data.get('additional_credits', 0)
@@ -348,6 +351,7 @@ def extend_key():
 
     return jsonify({"message": "Key extended successfully"})
 
+
 @app.route('/check_expired_keys', methods=['GET'])
 def check_expired_keys():
     now = datetime.utcnow()
@@ -367,23 +371,19 @@ def check_expired_keys():
             exp_date = datetime.fromisoformat(row[5])
             if exp_date < now:
                 expired.append({
-                    'key': row[0],
-                    'tier': row[1],
-                    'credits': row[2],
-                    'issued_to': row[3],
-                    'created_at': row[4],
-                    'expires_at': row[5]
+                    'key': row[0], 'tier': row[1], 'credits': row[2],
+                    'issued_to': row[3], 'created_at': row[4], 'expires_at': row[5]
                 })
         except Exception:
             continue
 
     return jsonify({'expired_keys': expired})
 
+
 @app.route('/key_stats', methods=['POST'])
 def key_stats():
-    data = request.get_json()
+    data = request.get_json() or {}
     key = data.get('key')
-
     if not key:
         return jsonify({'error': 'Missing key'}), 400
 
@@ -400,20 +400,16 @@ def key_stats():
     days_active = (datetime.utcnow() - created).days
 
     return jsonify({
-        'key': row[0],
-        'tier': row[1],
-        'credits': row[2],
-        'issued_to': row[3],
-        'created_at': row[4],
-        'expires_at': row[5],
-        'days_since_created': days_active
+        'key': row[0], 'tier': row[1], 'credits': row[2], 'issued_to': row[3],
+        'created_at': row[4], 'expires_at': row[5], 'days_since_created': days_active
     })
+
 
 @app.route('/reset_hwid', methods=['POST'])
 @require_server_auth
 @limiter.limit("5 per minute")
 def reset_hwid():
-    data = request.get_json()
+    data = request.get_json() or {}
     key = data.get('key')
     admin_password = data.get('admin_password')
 
@@ -436,11 +432,12 @@ def reset_hwid():
 
     return jsonify({'message': 'HWID reset successfully'})
 
+
 @app.route('/consume_credits', methods=['POST'])
 def consume_credits():
-    data = request.get_json()
+    data = request.get_json() or {}
     key = data.get('key')
-    amount = data.get('amount', 1)  # default to 1 credit per use
+    amount = data.get('amount', 1)
 
     if not key:
         return jsonify({'error': 'Missing key'}), 400
@@ -466,9 +463,10 @@ def consume_credits():
 
     return jsonify({'message': 'Credits consumed', 'remaining_credits': updated_credits})
 
+
 @app.route('/spoof', methods=['POST'])
 def spoof():
-    data = request.get_json()
+    data = request.get_json() or {}
     key = data.get('key')
     hwid = data.get('hwid')
 
@@ -478,7 +476,7 @@ def spoof():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # Step 1: Check if it's a VA key
+    # VA key?
     cursor.execute('SELECT parent_key FROM va_keys WHERE va_key = ?', (key,))
     va_row = cursor.fetchone()
 
@@ -497,32 +495,20 @@ def spoof():
             conn.close()
             return jsonify({'error': 'Parent license expired'}), 403
 
-        # Tier usage limits
-        limits = {
-            'trial': 5,
-            'lite': 5000,
-            'premium': 25000,
-            'custom': float('inf'),
-            'master': float('inf')
-        }
+        limits = {'trial': 5, 'lite': 5000, 'premium': 25000, 'custom': float('inf'), 'master': float('inf')}
         limit = limits.get(tier, 0)
 
         if usage_count >= limit:
             conn.close()
             return jsonify({'error': f'{tier.capitalize()} usage limit reached'}), 403
 
-        # Increment usage on parent license
         cursor.execute('UPDATE licenses SET usage_count = usage_count + 1 WHERE key = ?', (parent_key,))
         conn.commit()
         conn.close()
 
-        return jsonify({
-            'success': True,
-            'tier': f'VA-{tier}',
-            'remaining_spoofs': int(limit - usage_count - 1)
-        })
+        return jsonify({'success': True, 'tier': f'VA-{tier}', 'remaining_spoofs': int(limit - usage_count - 1)})
 
-    # Step 2: Not a VA key — regular license path
+    # Regular license
     reset_usage_if_needed(key, conn)
     cursor.execute('SELECT tier, usage_count, hwid, expires_at FROM licenses WHERE key = ?', (key,))
     row = cursor.fetchone()
@@ -533,16 +519,10 @@ def spoof():
 
     tier, usage_count, stored_hwid, expires_at = row
 
-    # 🔓 Master key: skip all restrictions
     if tier == 'master':
         conn.close()
-        return jsonify({
-            'success': True,
-            'tier': 'master',
-            'remaining_spoofs': '∞'
-        })
+        return jsonify({'success': True, 'tier': 'master', 'remaining_spoofs': '∞'})
 
-    # HWID check
     if stored_hwid and stored_hwid != hwid:
         conn.close()
         return jsonify({'error': 'HWID mismatch'}), 403
@@ -551,41 +531,28 @@ def spoof():
         conn.close()
         return jsonify({'error': 'License expired'}), 403
 
-    # Tier usage limits
-    limits = {
-        'trial': 5,
-        'lite': 5000,
-        'premium': 25000,
-        'custom': float('inf'),
-        'master': float('inf')  # still required for completeness
-    }
+    limits = {'trial': 5, 'lite': 5000, 'premium': 25000, 'custom': float('inf'), 'master': float('inf')}
     limit = limits.get(tier, 0)
 
     if usage_count >= limit:
         conn.close()
         return jsonify({'error': f'{tier.capitalize()} usage limit reached'}), 403
 
-    # Bind HWID on first spoof
     if not stored_hwid:
         cursor.execute('UPDATE licenses SET hwid = ? WHERE key = ?', (hwid, key))
 
-    # Increment usage
     cursor.execute('UPDATE licenses SET usage_count = usage_count + 1 WHERE key = ?', (key,))
     conn.commit()
     conn.close()
 
-    return jsonify({
-        'success': True,
-        'tier': tier,
-        'remaining_spoofs': int(limit - usage_count - 1)
-    })
+    return jsonify({'success': True, 'tier': tier, 'remaining_spoofs': int(limit - usage_count - 1)})
+
 
 @app.route('/stripe_webhook', methods=['POST'])
 def stripe_webhook():
-    import json
     payload = request.data
     sig_header = request.headers.get('Stripe-Signature', '')
-    endpoint_secret = 'whsec_0c7daf7d2686db1e3f7eafdcb0653475747f145f76a44a3365e9da3387a7f5e4'
+    endpoint_secret = STRIPE_WEBHOOK_SECRET
 
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
@@ -616,26 +583,19 @@ def stripe_webhook():
         new_price_id = subscription['items']['data'][0]['price']['id']
         customer_id = subscription['customer']
 
-        # Fetch customer email
         customer = stripe.Customer.retrieve(customer_id)
         customer_email = customer.get('email')
-
         if not customer_email:
             print("❌ Cannot update license – email not found.")
             return '', 400
 
-        # Determine new plan
         if "premium" in new_price_id:
-            new_tier = "premium"
-            new_credits = 25000
+            new_tier = "premium"; new_credits = 25000
         elif "lite" in new_price_id:
-            new_tier = "lite"
-            new_credits = 5000
+            new_tier = "lite"; new_credits = 5000
         else:
-            new_tier = "custom"
-            new_credits = 999999
+            new_tier = "custom"; new_credits = 999999
 
-        # Update in database
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('UPDATE licenses SET tier = ?, credits = ? WHERE issued_to = ?', (new_tier, new_credits, customer_email))
@@ -644,7 +604,7 @@ def stripe_webhook():
 
         print(f"🔁 Updated {customer_email} to {new_tier}")
 
-    elif event['type'] == 'customer.subscription.deleted':  # ← this line needs to be indented
+    elif event['type'] == 'customer.subscription.deleted':
         subscription = event['data']['object']
         customer_id = subscription.get('customer')
         current_period_end = subscription.get('current_period_end')
@@ -674,24 +634,20 @@ def stripe_webhook():
 
     return '', 200
 
+
 def generate_license_for_user(issued_to, plan, email=None):
     print(f"🧪 Generating license for {issued_to} with plan: {plan}")
     new_key = str(uuid.uuid4()).replace('-', '')
     created_at = datetime.utcnow().isoformat()
     expires_at = (datetime.utcnow() + timedelta(days=30)).isoformat()
 
-    # Plan logic (safe)
     if plan.lower() == 'lite':
-        credits = 5000
-        tier = 'lite'
+        credits = 5000; tier = 'lite'
     elif plan.lower() == 'premium':
-        credits = 25000
-        tier = 'premium'
+        credits = 25000; tier = 'premium'
     else:
-        credits = 999999
-        tier = 'custom'
+        credits = 999999; tier = 'custom'
 
-    # ✅ Insert into database
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
@@ -701,27 +657,24 @@ def generate_license_for_user(issued_to, plan, email=None):
     conn.commit()
     conn.close()
 
-    # ✅ Send email
-    target_email = email or issued_to
+    # Send email (optional: move SMTP creds to env)
     send_email(
-        to_email=target_email,
+        to_email=(email or issued_to),
         subject="🎟️ Your Spectre Spoofer License",
-        body=f"""
-Thanks for your purchase!
+        body=f"""Thanks for your purchase!
 
 🔑 License Key: {new_key}
 📦 Plan: {tier.capitalize()}
 📅 Expires: {expires_at}
 
 To install and activate:
-1. Download the Installer: https://spectrespoofer.com/download
-2. Enter the license key when prompted.
-3. Enjoy!
+1) Download: https://spectrespoofer.com/download
+2) Enter the license key when prompted.
 
-Questions? Contact us anytime.
-– Team Spectre
+— Team Spectre
 """
     )
+
 
 def cancel_user_license(email):
     expires_at = (datetime.utcnow() + timedelta(days=30)).isoformat()
@@ -731,8 +684,14 @@ def cancel_user_license(email):
     conn.commit()
     conn.close()
 
+
 @app.route('/buy/<plan>', methods=['GET'])
 def buy(plan):
+    """
+    Live one-time checkout using product IDs you created in Stripe (LIVE).
+    Adjust unit_amounts as needed.
+    """
+    plan = plan.lower()
     if plan not in ['lite', 'premium']:
         return jsonify({'error': 'Invalid plan'}), 400
 
@@ -740,66 +699,60 @@ def buy(plan):
     if not tg_username:
         return jsonify({'error': 'Missing Telegram username. Use ?tg=your_username'}), 400
 
+    # Map plan -> product id + amount (USD cents)
+    if plan == 'lite':
+        product_id = 'prod_SWu7ab0IXlIwGK'
+        unit_amount = 3000
+    else:
+        product_id = 'prod_SWu8FgZZV11Hmm'
+        unit_amount = 10000
+
     try:
         checkout_session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             line_items=[{
                 'price_data': {
                     'currency': 'usd',
-                    'unit_amount': 3000 if plan == 'lite' else 10000,
-                    'product_data': {
-                        'name': f'{plan.capitalize()} License'
-                    },
+                    'unit_amount': unit_amount,
+                    'product': product_id
                 },
                 'quantity': 1,
             }],
             mode='payment',
-            success_url=f"https://spectrespoofer.com/success",  # optional: update later
-            cancel_url='https://spectrespoofer.com/cancel',
-            metadata={
-                'plan': plan,
-                'telegram': tg_username  # ✅ Binds to Telegram username instead of email
-            }
+            success_url=f"{APP_BASE_URL}/success",
+            cancel_url=f"{APP_BASE_URL}/cancel",
+            metadata={'plan': plan, 'telegram': tg_username}
         )
         return jsonify({'checkout_url': checkout_session.url})
     except Exception as e:
         return jsonify(error=str(e)), 500
-    
+
+
 @app.route('/billing_portal', methods=['GET'])
 def billing_portal():
-    # In production, replace this with the real customer ID from your DB
-    test_customer_id = "cus_SmxLn1uCKzJxQx"  # ⚠️ Replace with actual customer ID in production
+    """
+    Live billing portal – finds/creates the customer by email.
+    """
+    email = request.args.get("email", "").strip()
+    if not email:
+        return jsonify({"error": "Missing ?email="}), 400
 
     try:
+        customers = stripe.Customer.list(email=email, limit=1).data
+        if customers:
+            customer_id = customers[0].id
+        else:
+            customer = stripe.Customer.create(email=email, metadata={"source": "spectre-spoofer"})
+            customer_id = customer.id
+
         session = stripe.billing_portal.Session.create(
-            customer=test_customer_id,
-            return_url="http://127.0.0.1:5000/license?email=test@example.com"
+            customer=customer_id,
+            return_url=f"{APP_BASE_URL}"
         )
         return jsonify({'portal_url': session.url})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/license', methods=['GET'])
-def license_lookup():
-    email = request.args.get('email')
-    if not email:
-        return jsonify({'error': 'Missing email'}), 400
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('SELECT key, tier, credits, expires_at FROM licenses WHERE issued_to = ?', (email,))
-    result = cursor.fetchone()
-    conn.close()
-
-    if not result:
-        return jsonify({'error': 'No license found'}), 404
-
-    return jsonify({
-        'license_key': result[0],
-        'tier': result[1],
-        'credits': result[2],
-        'expires_at': result[3]
-    })
 
 @app.route('/va_keys', methods=['GET'])
 @require_server_auth
@@ -810,17 +763,14 @@ def view_va_keys():
     rows = cursor.fetchall()
     conn.close()
 
-    return jsonify({
-        'va_keys': [{
-            'parent_key': r[0],
-            'va_key': r[1],
-            'created_at': r[2]
-        } for r in rows]
-    })
+    return jsonify({'va_keys': [
+        {'parent_key': r[0], 'va_key': r[1], 'created_at': r[2]} for r in rows
+    ]})
+
 
 @app.route('/send_email', methods=['POST'])
 def send_email_route():
-    data = request.get_json()
+    data = request.get_json() or {}
     to_email = data.get("to")
     subject = data.get("subject", "Test Email")
     body = data.get("body", "This is a test email from Spectre Spoofer.")
@@ -831,30 +781,25 @@ def send_email_route():
     send_email(to_email, subject, body)
     return jsonify({"message": f"Email sent to {to_email}"}), 200
 
+
 @app.route('/generate_va_key', methods=['POST'])
 @require_server_auth
 @limiter.limit("10 per minute")
 def generate_va_key():
-    data = request.get_json()
+    data = request.get_json() or {}
     parent_key = data.get('parent_key')
-
     if not parent_key:
         return jsonify({'error': 'Missing parent_key'}), 400
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
-    # Get tier
     cursor.execute('SELECT tier FROM licenses WHERE key = ?', (parent_key,))
     result = cursor.fetchone()
     if not result:
         conn.close()
         return jsonify({'error': 'Parent key not found'}), 404
 
-    tier = result[0].lower().strip()
-    print(f"DEBUG: parent_key = {parent_key}, tier = {tier}")
-
-    # VA limits
+    tier = (result[0] or '').lower().strip()
     cursor.execute('SELECT COUNT(*) FROM va_keys WHERE parent_key = ?', (parent_key,))
     count = cursor.fetchone()[0]
 
@@ -865,7 +810,6 @@ def generate_va_key():
         conn.close()
         return jsonify({'error': 'Only premium or custom tiers can generate VA keys'}), 403
 
-    # Generate VA key
     va_key = str(uuid.uuid4()).replace('-', '')
     created_at = datetime.utcnow().isoformat()
 
@@ -876,8 +820,8 @@ def generate_va_key():
 
     conn.commit()
     conn.close()
-
     return jsonify({'va_key': va_key})
+
 
 @app.route('/generate_fam_key', methods=['POST'])
 @require_server_auth
@@ -885,7 +829,6 @@ def generate_va_key():
 def generate_fam_key():
     data = request.get_json(force=True)
     issued_to = data.get('issued_to')
-
     if not issued_to:
         return jsonify({'error': 'Missing issued_to'}), 400
 
@@ -907,8 +850,8 @@ def generate_fam_key():
 
     conn.commit()
     conn.close()
-
     return jsonify({'generated_key': new_key})
+
 
 def send_email(to_email, subject, body):
     import smtplib
@@ -918,7 +861,7 @@ def send_email(to_email, subject, body):
     smtp_server = "smtppro.zoho.com"
     smtp_port = 465
     from_email = "team@spectrespoofer.com"
-    app_password = "1T4HMU4SmyRX"
+    app_password = os.environ.get("SMTP_APP_PASSWORD", "1T4HMU4SmyRX")  # move to env
 
     msg = MIMEMultipart()
     msg["From"] = from_email
@@ -934,10 +877,10 @@ def send_email(to_email, subject, body):
     except Exception as e:
         print(f"❌ Failed to send email to {to_email}: {e}")
 
+
 def init_va_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS va_keys (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -947,17 +890,17 @@ def init_va_db():
             FOREIGN KEY(parent_key) REFERENCES licenses(key)
         )
     ''')
-
     conn.commit()
     conn.close()
+
 
 @app.route('/admin_delete_key', methods=['POST'])
 def admin_delete_key():
     auth = request.headers.get("Authorization")
-    if auth != "RichOffSoftware22!":
+    if auth != SERVER_SECRET:
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.get_json()
+    data = request.get_json() or {}
     key_to_delete = data.get("key")
     if not key_to_delete:
         return jsonify({"error": "No key provided"}), 400
@@ -970,8 +913,10 @@ def admin_delete_key():
 
     return jsonify({"status": "deleted", "key": key_to_delete})
 
+
 if __name__ == '__main__':
     init_db()
     init_va_db()
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    # Do NOT enable debug in production
+    app.run(host='0.0.0.0', port=port, debug=False)
