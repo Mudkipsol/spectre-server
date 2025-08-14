@@ -26,6 +26,19 @@ if not STRIPE_SECRET_KEY.startswith('sk_live_'):
 stripe.api_key = STRIPE_SECRET_KEY
 
 app = Flask(__name__)
+@app.route('/_debug_auth', methods=['GET'])
+def _debug_auth():
+    got = request.headers.get('Authorization', '')
+    import os
+    srv = os.environ.get('SERVER_SECRET', '')
+    def mask(s): 
+        return (s[:4] + '…' + s[-4:]) if len(s) >= 8 else ('(empty)' if not s else s[0] + '…')
+    return jsonify({
+        "received_header": mask(got),
+        "server_secret": mask(srv),
+        "same_length": len(got) == len(srv),
+        "exact_match": got == srv
+    })
 limiter = Limiter(get_remote_address, app=app, default_limits=["10 per minute"])
 
 
@@ -49,12 +62,15 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 def require_server_auth(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
-        auth = request.headers.get("Authorization")
-        if not SERVER_SECRET or auth != SERVER_SECRET:
+        provided = (
+            request.headers.get("Authorization")
+            or request.headers.get("X-Server-Secret")    # alt header (temporary)
+            or request.args.get("auth")                  # query param (temporary)
+        )
+        if not SERVER_SECRET or provided != SERVER_SECRET:
             return jsonify({"error": "Unauthorized"}), 401
         return f(*args, **kwargs)
     return wrapper
