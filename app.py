@@ -27,18 +27,6 @@ stripe.api_key = STRIPE_SECRET_KEY
 
 app = Flask(__name__)
 @app.route('/_debug_auth', methods=['GET'])
-def _debug_auth():
-    got = request.headers.get('Authorization', '')
-    import os
-    srv = os.environ.get('SERVER_SECRET', '')
-    def mask(s): 
-        return (s[:4] + '…' + s[-4:]) if len(s) >= 8 else ('(empty)' if not s else s[0] + '…')
-    return jsonify({
-        "received_header": mask(got),
-        "server_secret": mask(srv),
-        "same_length": len(got) == len(srv),
-        "exact_match": got == srv
-    })
 limiter = Limiter(get_remote_address, app=app, default_limits=["10 per minute"])
 
 
@@ -65,16 +53,11 @@ def init_db():
 def require_server_auth(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
-        provided = (
-            request.headers.get("Authorization")
-            or request.headers.get("X-Server-Secret")    # alt header (temporary)
-            or request.args.get("auth")                  # query param (temporary)
-        )
+        provided = request.headers.get("Authorization")
         if not SERVER_SECRET or provided != SERVER_SECRET:
             return jsonify({"error": "Unauthorized"}), 401
         return f(*args, **kwargs)
     return wrapper
-
 
 def key_exists(key):
     conn = sqlite3.connect(DB_PATH)
@@ -877,7 +860,10 @@ def send_email(to_email, subject, body):
     smtp_server = "smtppro.zoho.com"
     smtp_port = 465
     from_email = "team@spectrespoofer.com"
-    app_password = os.environ.get("SMTP_APP_PASSWORD", "1T4HMU4SmyRX")  # move to env
+    app_password = os.environ.get("SMTP_APP_PASSWORD")
+    if not app_password:
+        print("❌ SMTP_APP_PASSWORD missing; cannot send email.")
+        return
 
     msg = MIMEMultipart()
     msg["From"] = from_email
