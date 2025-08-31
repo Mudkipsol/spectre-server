@@ -19,7 +19,7 @@ STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
 SERVER_SECRET         = os.environ.get('SERVER_SECRET', '')
 MASTER_KEY            = os.environ.get('MASTER_KEY', 'spectre-master-7788')
 APP_BASE_URL          = os.environ.get('APP_BASE_URL', 'https://spectrespoofer.com')
-SMTP_APP_PASSWORD     = os.environ.get('SMTP_APP_PASSWORD', 'MAENfTZnP0yZ')
+SMTP_APP_PASSWORD     = os.environ.get('SMTP_APP_PASSWORD')
 
 # Fail fast if not live key
 if not STRIPE_SECRET_KEY.startswith('sk_live_'):
@@ -777,8 +777,26 @@ def send_email_route():
     if not to_email:
         return jsonify({"error": "Missing 'to' field"}), 400
 
-    send_email(to_email, subject, body)
-    return jsonify({"message": f"Email sent to {to_email}"}), 200
+    success = send_email(to_email, subject, body)
+    if success:
+        return jsonify({"message": f"Email sent successfully to {to_email}"}), 200
+    else:
+        return jsonify({"error": f"Failed to send email to {to_email}"}), 500
+
+
+@app.route('/test_email', methods=['GET'])
+def test_email():
+    """Quick email test endpoint"""
+    test_email_addr = request.args.get('email', 'test@example.com')
+    success = send_email(
+        test_email_addr, 
+        "🧪 Spectre Email Test", 
+        "This is a test email to verify SMTP configuration is working correctly.\n\nIf you receive this, emails are working! ✅"
+    )
+    if success:
+        return jsonify({"status": "success", "message": f"Test email sent to {test_email_addr}"}), 200
+    else:
+        return jsonify({"status": "error", "message": f"Failed to send test email to {test_email_addr}"}), 500
 
 
 @app.route('/generate_va_key', methods=['POST'])
@@ -856,14 +874,20 @@ def send_email(to_email, subject, body):
     import smtplib
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
+    import socket
 
-    smtp_server = "smtppro.zoho.com"
-    smtp_port = 465
     from_email = "team@spectrespoofer.com"
     app_password = SMTP_APP_PASSWORD
     if not app_password:
         print("❌ SMTP_APP_PASSWORD missing; cannot send email.")
         return
+
+    # Railway-optimized SMTP configuration for Zoho
+    smtp_configs = [
+        {"server": "smtp.zoho.com", "port": 587, "use_ssl": False},  # Most reliable on Railway
+        {"server": "smtp.zoho.com", "port": 465, "use_ssl": True},
+        {"server": "smtppro.zoho.com", "port": 587, "use_ssl": False},
+    ]
 
     msg = MIMEMultipart()
     msg["From"] = from_email
@@ -871,13 +895,37 @@ def send_email(to_email, subject, body):
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    try:
-        with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
+    for config in smtp_configs:
+        try:
+            print(f"🔄 Trying SMTP: {config['server']}:{config['port']} (SSL: {config['use_ssl']})")
+            
+            if config["use_ssl"]:
+                server = smtplib.SMTP_SSL(config["server"], config["port"], timeout=10)
+            else:
+                server = smtplib.SMTP(config["server"], config["port"], timeout=10)
+                server.starttls()
+            
             server.login(from_email, app_password)
             server.sendmail(from_email, to_email, msg.as_string())
-            print(f"✅ Email sent to {to_email}")
-    except Exception as e:
-        print(f"❌ Failed to send email to {to_email}: {e}")
+            server.quit()
+            print(f"✅ Email sent to {to_email} via {config['server']}:{config['port']}")
+            return True
+            
+        except socket.timeout:
+            print(f"⏰ Timeout connecting to {config['server']}:{config['port']}")
+            continue
+        except smtplib.SMTPAuthenticationError as e:
+            print(f"🔐 Authentication failed for {config['server']}: {e}")
+            continue
+        except smtplib.SMTPException as e:
+            print(f"📧 SMTP error with {config['server']}: {e}")
+            continue
+        except Exception as e:
+            print(f"❌ Failed with {config['server']}:{config['port']}: {e}")
+            continue
+    
+    print(f"❌ All SMTP configurations failed for {to_email}")
+    return False
 
 
 def init_va_db():
