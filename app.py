@@ -2,7 +2,7 @@ import os
 from flask import Flask, request, jsonify
 import sqlite3
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import stripe
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -83,7 +83,7 @@ def reset_usage_if_needed(key, conn=None):
         return
 
     tier, usage_count, last_reset = row
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     should_reset = False
     if last_reset:
@@ -137,7 +137,7 @@ def verify_key():
         tier, credits, expires_at, stored_hwid, issued_to = result
         stored_hwid = stored_hwid or None
 
-        if expires_at and datetime.fromisoformat(expires_at) < datetime.utcnow():
+        if expires_at and datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
             print("❌ Rejected: License expired")
             conn.close()
             return jsonify({'valid': False, 'reason': 'License expired'}), 403
@@ -177,7 +177,7 @@ def verify_key():
 
         if parent_result:
             tier, credits, expires_at = parent_result
-            if expires_at and datetime.fromisoformat(expires_at) < datetime.utcnow():
+            if expires_at and datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
                 conn.close()
                 return jsonify({'valid': False, 'reason': 'Parent license expired'}), 403
 
@@ -210,8 +210,8 @@ def generate_key():
         return jsonify({'error': 'Missing tier, credits, or issued_to'}), 400
 
     new_key = str(uuid.uuid4()).replace('-', '') + str(uuid.uuid4()).split('-')[0]
-    created_at = datetime.utcnow().isoformat()
-    expires_at = (datetime.utcnow() + timedelta(days=30)).isoformat()
+    created_at = datetime.now(timezone.utc).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -338,7 +338,7 @@ def extend_key():
 
     current_credits = result[1]
     updated_credits = current_credits + int(additional_credits)
-    new_expiry = (datetime.utcnow() + timedelta(days=30)).isoformat()
+    new_expiry = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
 
     cursor.execute('''
         UPDATE licenses
@@ -353,7 +353,7 @@ def extend_key():
 
 @app.route('/check_expired_keys', methods=['GET'])
 def check_expired_keys():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
@@ -379,6 +379,27 @@ def check_expired_keys():
     return jsonify({'expired_keys': expired})
 
 
+@app.route('/license', methods=['GET'])
+def get_license():
+    email = request.args.get('email', '').strip()
+    if not email:
+        return jsonify({'error': 'Missing email parameter'}), 400
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT key, tier, credits, created_at, expires_at FROM licenses WHERE issued_to = ?', (email,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({'error': 'No license found for this email'}), 404
+
+    return jsonify({
+        'key': row[0], 'tier': row[1], 'credits': row[2],
+        'created_at': row[3], 'expires_at': row[4]
+    })
+
+
 @app.route('/key_stats', methods=['POST'])
 def key_stats():
     data = request.get_json() or {}
@@ -396,7 +417,7 @@ def key_stats():
         return jsonify({'error': 'Key not found'}), 404
 
     created = datetime.fromisoformat(row[4])
-    days_active = (datetime.utcnow() - created).days
+    days_active = (datetime.now(timezone.utc) - created).days
 
     return jsonify({
         'key': row[0], 'tier': row[1], 'credits': row[2], 'issued_to': row[3],
@@ -490,7 +511,7 @@ def spoof():
 
         tier, usage_count, expires_at = parent_result
 
-        if expires_at and datetime.fromisoformat(expires_at) < datetime.utcnow():
+        if expires_at and datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
             conn.close()
             return jsonify({'error': 'Parent license expired'}), 403
 
@@ -526,7 +547,7 @@ def spoof():
         conn.close()
         return jsonify({'error': 'HWID mismatch'}), 403
 
-    if expires_at and datetime.fromisoformat(expires_at) < datetime.utcnow():
+    if expires_at and datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
         conn.close()
         return jsonify({'error': 'License expired'}), 403
 
@@ -637,8 +658,8 @@ def stripe_webhook():
 def generate_license_for_user(issued_to, plan, email=None):
     print(f"🧪 Generating license for {issued_to} with plan: {plan}")
     new_key = str(uuid.uuid4()).replace('-', '')
-    created_at = datetime.utcnow().isoformat()
-    expires_at = (datetime.utcnow() + timedelta(days=30)).isoformat()
+    created_at = datetime.now(timezone.utc).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
 
     if plan.lower() == 'lite':
         credits = 5000; tier = 'lite'
@@ -676,7 +697,7 @@ To install and activate:
 
 
 def cancel_user_license(email):
-    expires_at = (datetime.utcnow() + timedelta(days=30)).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('UPDATE licenses SET expires_at = ? WHERE issued_to = ?', (expires_at, email))
@@ -779,24 +800,9 @@ def send_email_route():
 
     success = send_email(to_email, subject, body)
     if success:
-        return jsonify({"message": f"Email sent successfully to {to_email}"}), 200
+        return jsonify({"message": f"Email sent to {to_email}"}), 200
     else:
         return jsonify({"error": f"Failed to send email to {to_email}"}), 500
-
-
-@app.route('/test_email', methods=['GET'])
-def test_email():
-    """Quick email test endpoint"""
-    test_email_addr = request.args.get('email', 'test@example.com')
-    success = send_email(
-        test_email_addr, 
-        "🧪 Spectre Email Test", 
-        "This is a test email to verify SMTP configuration is working correctly.\n\nIf you receive this, emails are working! ✅"
-    )
-    if success:
-        return jsonify({"status": "success", "message": f"Test email sent to {test_email_addr}"}), 200
-    else:
-        return jsonify({"status": "error", "message": f"Failed to send test email to {test_email_addr}"}), 500
 
 
 @app.route('/generate_va_key', methods=['POST'])
@@ -828,7 +834,7 @@ def generate_va_key():
         return jsonify({'error': 'Only premium or custom tiers can generate VA keys'}), 403
 
     va_key = str(uuid.uuid4()).replace('-', '')
-    created_at = datetime.utcnow().isoformat()
+    created_at = datetime.now(timezone.utc).isoformat()
 
     cursor.execute('''
         INSERT INTO va_keys (parent_key, va_key, created_at)
@@ -857,8 +863,8 @@ def generate_fam_key():
         return jsonify({'error': 'User already has a fam key'}), 403
 
     new_key = str(uuid.uuid4()).replace('-', '')
-    created_at = datetime.utcnow().isoformat()
-    expires_at = (datetime.utcnow() + timedelta(days=9999)).isoformat()
+    created_at = datetime.now(timezone.utc).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=9999)).isoformat()
 
     cursor.execute('''
         INSERT INTO licenses (key, tier, credits, issued_to, created_at, expires_at)
@@ -872,21 +878,23 @@ def generate_fam_key():
 
 def send_email(to_email, subject, body):
     import smtplib
+    import socket
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
-    import socket
 
     from_email = "team@spectrespoofer.com"
     app_password = SMTP_APP_PASSWORD
+    
     if not app_password:
         print("❌ SMTP_APP_PASSWORD missing; cannot send email.")
-        return
+        return False
 
-    # Railway-optimized SMTP configuration for Zoho
+    # SMTP configurations to try in order
     smtp_configs = [
-        {"server": "smtp.zoho.com", "port": 587, "use_ssl": False},  # Most reliable on Railway
-        {"server": "smtp.zoho.com", "port": 465, "use_ssl": True},
-        {"server": "smtppro.zoho.com", "port": 587, "use_ssl": False},
+        {"server": "smtp.zoho.com", "port": 587, "ssl": False},
+        {"server": "smtp.zoho.com", "port": 465, "ssl": True},
+        {"server": "smtppro.zoho.com", "port": 587, "ssl": False},
+        {"server": "smtppro.zoho.com", "port": 465, "ssl": True}
     ]
 
     msg = MIMEMultipart()
@@ -897,12 +905,12 @@ def send_email(to_email, subject, body):
 
     for config in smtp_configs:
         try:
-            print(f"🔄 Trying SMTP: {config['server']}:{config['port']} (SSL: {config['use_ssl']})")
+            print(f"🔄 Trying SMTP: {config['server']}:{config['port']} (SSL: {config['ssl']})")
             
-            if config["use_ssl"]:
-                server = smtplib.SMTP_SSL(config["server"], config["port"], timeout=10)
+            if config['ssl']:
+                server = smtplib.SMTP_SSL(config['server'], config['port'], timeout=30)
             else:
-                server = smtplib.SMTP(config["server"], config["port"], timeout=10)
+                server = smtplib.SMTP(config['server'], config['port'], timeout=30)
                 server.starttls()
             
             server.login(from_email, app_password)
@@ -915,13 +923,10 @@ def send_email(to_email, subject, body):
             print(f"⏰ Timeout connecting to {config['server']}:{config['port']}")
             continue
         except smtplib.SMTPAuthenticationError as e:
-            print(f"🔐 Authentication failed for {config['server']}: {e}")
-            continue
-        except smtplib.SMTPException as e:
-            print(f"📧 SMTP error with {config['server']}: {e}")
+            print(f"🔐 Authentication failed for {config['server']}:{config['port']}: {e}")
             continue
         except Exception as e:
-            print(f"❌ Failed with {config['server']}:{config['port']}: {e}")
+            print(f"❌ Failed to send via {config['server']}:{config['port']}: {e}")
             continue
     
     print(f"❌ All SMTP configurations failed for {to_email}")
