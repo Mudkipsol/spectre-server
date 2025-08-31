@@ -859,7 +859,7 @@ def send_email(to_email, subject, body):
     smtp_server = "smtppro.zoho.com"
     smtp_port = 465
     from_email = "team@spectrespoofer.com"
-    app_password = os.environ.get("SMTP_APP_PASSWORD")
+    app_password = os.environ.get("BL1gunciPqEH")
     if not app_password:
         print("❌ SMTP_APP_PASSWORD missing; cannot send email.")
         return
