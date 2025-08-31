@@ -19,7 +19,7 @@ STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
 SERVER_SECRET         = os.environ.get('SERVER_SECRET', '')
 MASTER_KEY            = os.environ.get('MASTER_KEY', 'spectre-master-7788')
 APP_BASE_URL          = os.environ.get('APP_BASE_URL', 'https://spectrespoofer.com')
-SMT_APP_PASSWORD      = os.environ.get('SMT_APP_PASSWORD', 'BL1gunciPqEH')
+SMTP_APP_PASSWORD     = os.environ.get('SMTP_APP_PASSWORD', 'BL1gunciPqEH')
 
 # Fail fast if not live key
 if not STRIPE_SECRET_KEY.startswith('sk_live_'):
