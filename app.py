@@ -20,6 +20,9 @@ SERVER_SECRET         = os.environ.get('SERVER_SECRET', '')
 MASTER_KEY            = os.environ.get('MASTER_KEY', 'spectre-master-7788')
 APP_BASE_URL          = os.environ.get('APP_BASE_URL', 'https://spectrespoofer.com')
 SMTP_APP_PASSWORD     = os.environ.get('SMTP_APP_PASSWORD')
+EMAIL_PROVIDER        = os.environ.get('EMAIL_PROVIDER', 'smtp').lower()
+SENDGRID_API_KEY      = os.environ.get('SENDGRID_API_KEY')
+FROM_EMAIL            = os.environ.get('FROM_EMAIL', 'team@spectrespoofer.com')
 
 # Fail fast if not live key
 if not STRIPE_SECRET_KEY.startswith('sk_live_'):
@@ -103,6 +106,17 @@ def reset_usage_if_needed(key, conn=None):
         conn.close()
 
 
+# --- Datetime helpers ---
+def to_aware_utc(dt_str):
+    """Parse ISO string and ensure timezone-aware UTC datetime."""
+    try:
+        dt = datetime.fromisoformat(dt_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
 # ----------------- Routes -----------------
 @app.route('/')
 def index():
@@ -137,7 +151,7 @@ def verify_key():
         tier, credits, expires_at, stored_hwid, issued_to = result
         stored_hwid = stored_hwid or None
 
-        if expires_at and datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
+        if expires_at and to_aware_utc(expires_at) and to_aware_utc(expires_at) < datetime.now(timezone.utc):
             print("❌ Rejected: License expired")
             conn.close()
             return jsonify({'valid': False, 'reason': 'License expired'}), 403
@@ -177,7 +191,7 @@ def verify_key():
 
         if parent_result:
             tier, credits, expires_at = parent_result
-            if expires_at and datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
+            if expires_at and to_aware_utc(expires_at) and to_aware_utc(expires_at) < datetime.now(timezone.utc):
                 conn.close()
                 return jsonify({'valid': False, 'reason': 'Parent license expired'}), 403
 
@@ -367,8 +381,8 @@ def check_expired_keys():
     expired = []
     for row in rows:
         try:
-            exp_date = datetime.fromisoformat(row[5])
-            if exp_date < now:
+            exp_date = to_aware_utc(row[5])
+            if exp_date and exp_date < now:
                 expired.append({
                     'key': row[0], 'tier': row[1], 'credits': row[2],
                     'issued_to': row[3], 'created_at': row[4], 'expires_at': row[5]
@@ -416,7 +430,7 @@ def key_stats():
     if not row:
         return jsonify({'error': 'Key not found'}), 404
 
-    created = datetime.fromisoformat(row[4])
+    created = to_aware_utc(row[4])
     days_active = (datetime.now(timezone.utc) - created).days
 
     return jsonify({
@@ -511,7 +525,7 @@ def spoof():
 
         tier, usage_count, expires_at = parent_result
 
-        if expires_at and datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
+        if expires_at and to_aware_utc(expires_at) and to_aware_utc(expires_at) < datetime.now(timezone.utc):
             conn.close()
             return jsonify({'error': 'Parent license expired'}), 403
 
@@ -547,7 +561,7 @@ def spoof():
         conn.close()
         return jsonify({'error': 'HWID mismatch'}), 403
 
-    if expires_at and datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
+    if expires_at and to_aware_utc(expires_at) and to_aware_utc(expires_at) < datetime.now(timezone.utc):
         conn.close()
         return jsonify({'error': 'License expired'}), 403
 
@@ -640,7 +654,7 @@ def stripe_webhook():
             print("❌ No email found for subscription cancel.")
             return 'Missing email', 400
 
-        new_expiry = datetime.utcfromtimestamp(current_period_end).isoformat()
+        new_expiry = datetime.fromtimestamp(current_period_end, tz=timezone.utc).isoformat()
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
@@ -879,26 +893,50 @@ def generate_fam_key():
 def send_email(to_email, subject, body):
     import smtplib
     import socket
+    import json
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
-
-    from_email = "team@spectrespoofer.com"
-    app_password = SMTP_APP_PASSWORD
     
+    # Prefer HTTP API (SendGrid) when available, regardless of EMAIL_PROVIDER
+    if SENDGRID_API_KEY:
+        try:
+            import urllib.request
+            url = 'https://api.sendgrid.com/v3/mail/send'
+            payload = {
+                "personalizations": [{"to": [{"email": to_email}]}],
+                "from": {"email": FROM_EMAIL},
+                "subject": subject,
+                "content": [{"type": "text/plain", "value": body}],
+            }
+            req = urllib.request.Request(url, method='POST')
+            req.add_header('Authorization', f'Bearer {SENDGRID_API_KEY}')
+            req.add_header('Content-Type', 'application/json')
+            data = json.dumps(payload).encode('utf-8')
+            with urllib.request.urlopen(req, data=data, timeout=15) as resp:
+                if 200 <= resp.status < 300:
+                    print(f"✅ Email sent to {to_email} via SendGrid")
+                    return True
+                else:
+                    print(f"❌ SendGrid error status: {resp.status}")
+        except Exception as e:
+            print(f"❌ SendGrid send failed: {e}")
+            # fall through to SMTP
+
+    # Fallback to SMTP
+    app_password = SMTP_APP_PASSWORD
     if not app_password:
-        print("❌ SMTP_APP_PASSWORD missing; cannot send email.")
+        print("❌ SMTP_APP_PASSWORD missing; cannot send via SMTP.")
         return False
 
-    # SMTP configurations to try in order
     smtp_configs = [
         {"server": "smtp.zoho.com", "port": 587, "ssl": False},
         {"server": "smtp.zoho.com", "port": 465, "ssl": True},
         {"server": "smtppro.zoho.com", "port": 587, "ssl": False},
-        {"server": "smtppro.zoho.com", "port": 465, "ssl": True}
+        {"server": "smtppro.zoho.com", "port": 465, "ssl": True},
     ]
 
     msg = MIMEMultipart()
-    msg["From"] = from_email
+    msg["From"] = FROM_EMAIL
     msg["To"] = to_email
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
@@ -906,30 +944,27 @@ def send_email(to_email, subject, body):
     for config in smtp_configs:
         try:
             print(f"🔄 Trying SMTP: {config['server']}:{config['port']} (SSL: {config['ssl']})")
-            
             if config['ssl']:
-                server = smtplib.SMTP_SSL(config['server'], config['port'], timeout=30)
+                server = smtplib.SMTP_SSL(config['server'], config['port'], timeout=8)
             else:
-                server = smtplib.SMTP(config['server'], config['port'], timeout=30)
+                server = smtplib.SMTP(config['server'], config['port'], timeout=8)
                 server.starttls()
-            
-            server.login(from_email, app_password)
-            server.sendmail(from_email, to_email, msg.as_string())
+            server.login(FROM_EMAIL, app_password)
+            server.sendmail(FROM_EMAIL, to_email, msg.as_string())
             server.quit()
             print(f"✅ Email sent to {to_email} via {config['server']}:{config['port']}")
             return True
-            
         except socket.timeout:
             print(f"⏰ Timeout connecting to {config['server']}:{config['port']}")
             continue
         except smtplib.SMTPAuthenticationError as e:
             print(f"🔐 Authentication failed for {config['server']}:{config['port']}: {e}")
-            continue
+            break
         except Exception as e:
             print(f"❌ Failed to send via {config['server']}:{config['port']}: {e}")
             continue
-    
-    print(f"❌ All SMTP configurations failed for {to_email}")
+
+    print(f"❌ All email methods failed for {to_email}")
     return False
 
 
